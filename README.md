@@ -1,1 +1,3 @@
 # vulnbrief-skills
+
+Public Agent Skills for vulnerability management and CTEM, extracted from my ctem-lab work. The first skill, `openvex-propose-then-promote`, governs how an agent authors OpenVEX statements: it proposes `not_affected` suppressions to a staging store, and only a human can promote them to the canonical store scanners consume from. The agent is never given the promote capability — segregation of duties is enforced by privilege (`allowed_tools`, deny hooks, append-only audit), not by convention. The one-line test: "Can the agent, by any tool it holds, cause a scanner to stop alerting without a human action in between? If yes, the guardrail is incomplete."
