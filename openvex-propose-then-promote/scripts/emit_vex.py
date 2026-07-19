@@ -41,12 +41,18 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 OPENVEX_CONTEXT = "https://openvex.dev/ns/v0.2.0"
+
+# Vulnerability ids (CVE-..., GHSA-xxxx-..., GCVE-0-..., ANT-...) are plain
+# tokens. Anything outside this set — path separators above all — would flow
+# into the proposal filename and could escape the staging dir.
+VULN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 VALID_STATUSES = {"not_affected", "affected", "fixed", "under_investigation"}
 
@@ -65,6 +71,23 @@ CANONICAL_MARKERS = ("canonical", "promoted", "published", "prod-vex")
 
 def _now_rfc3339() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _parse_rfc3339(value: str, label: str) -> datetime:
+    """Parse an RFC3339 timestamp for comparison.
+
+    String comparison misorders timestamps with mixed UTC offsets, so
+    ordering checks must compare parsed datetimes. Naive timestamps are
+    treated as UTC rather than rejected (CISA minimums require a timestamp,
+    not an offset).
+    """
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError as e:
+        raise VexError(f"{label} is not a valid RFC3339 timestamp: {value!r}") from e
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _short_hash(text: str) -> str:
@@ -90,6 +113,11 @@ def build_statement(
     proposed: bool = True,
 ) -> dict:
     """Build and validate a single OpenVEX statement dict."""
+    if not VULN_ID_RE.fullmatch(vuln or ""):
+        raise VexError(
+            f"vulnerability id {vuln!r} is not a plain identifier "
+            "(letters/digits/._:- only, no path separators)."
+        )
     if status not in VALID_STATUSES:
         raise VexError(
             f"status {status!r} is not one of {sorted(VALID_STATUSES)}."
@@ -197,14 +225,16 @@ def _assert_document_valid(doc: dict) -> None:
                 raise VexError(f"statement[{i}] has non-fixed justification {j!r}.")
         if stmt["status"] == "affected" and not stmt.get("action_statement"):
             raise VexError(f"statement[{i}] is affected but has no action_statement.")
-        ts = stmt["timestamp"]
+        ts = _parse_rfc3339(stmt["timestamp"], f"statement[{i}].timestamp")
         newest = ts if newest is None or ts > newest else newest
 
-    last_updated = doc.get("last_updated", doc["timestamp"])
+    last_updated = _parse_rfc3339(
+        doc.get("last_updated", doc["timestamp"]), "document last_updated"
+    )
     if newest is not None and last_updated < newest:
         raise VexError(
             "document last_updated is older than the newest statement timestamp "
-            f"({last_updated} < {newest})."
+            f"({last_updated.isoformat()} < {newest.isoformat()})."
         )
 
 
@@ -224,9 +254,20 @@ def write_proposal(doc: dict, staging_dir: Path) -> Path:
     staging_dir.mkdir(parents=True, exist_ok=True)
     stmt = doc["statements"][0]
     vuln = stmt["vulnerability"]["name"]
+    if not VULN_ID_RE.fullmatch(vuln or ""):
+        raise VexError(
+            f"vulnerability id {vuln!r} is not a plain identifier — refusing to "
+            "use it in a filename."
+        )
     product = stmt["products"][0]["@id"]
     fname = f"vex-{vuln}-{_short_hash(product)}-proposed.json"
     out = staging_dir / fname
+    # Belt-and-braces containment: the resolved output path must stay inside
+    # the staging dir. Write containment is this tool's entire purpose.
+    if not out.resolve().is_relative_to(staging_dir.resolve()):
+        raise VexError(
+            f"refusing to write outside the staging dir: {out}"
+        )
     out.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
     return out
 
